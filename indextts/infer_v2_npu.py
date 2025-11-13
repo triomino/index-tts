@@ -5,6 +5,7 @@ import math
 from torch import Tensor
 import torchaudio
 import warnings
+import string
 from typing import Callable, Optional, Tuple, Union
 import torch.nn.functional as F
 
@@ -29,7 +30,7 @@ import torchair
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache' # TODO: remove
 
 # 批次大小列表，开启 auto_split 时只会用这些大小的 batch size，减少因为 batch size 变化导致重编译次数。
-DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 48, 64]
+DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
 # 音频切割后对齐到 batch 内最大长度
 def make_batch(self, sentences, pad_token_id):
@@ -94,14 +95,15 @@ class IndexTTS2NPU(IndexTTS2):
             block.attn.static = static
         # DiT 模块传递静态图模式参数
         self.s2mel.models['cfm'].estimator.static=static
-        self.s2mel.models['cfm'].estimator.max_seq_len=2048
+        self.s2mel.models['cfm'].estimator.max_seq_len=2147
         self.s2mel.models['cfm'].estimator.padding_token=8193 # TODO: 改成 stop_mel_token
-        # 改为字典结构，用于存储不同 batch_size 的编译图
-        self.s2mel.models['cfm'].estimator.compiled_transformers = {}
+        self.s2mel.models['cfm'].estimator.compiled_transformer = None
 
         self.gpt.inference_model.static = self.static
-        # 改为字典结构，用于存储不同 batch_size 的编译图
-        self.gpt.inference_model.compiled_transformers = {}
+        config = torchair.CompilerConfig()
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        self.gpt.inference_model.compiled_transformer=torchair.inference.cache_compile(self.gpt.inference_model.decode_with_embedding, dynamic=not self.static, fullgraph=True, backend=npu_backend, ge_cache=True)
+
 
 def infer_fast(self, spk_audio_prompt, text, output_path,
             emo_audio_prompt=None, emo_alpha=1.0,
@@ -116,7 +118,7 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
     """
     # max_text_tokens_per_segment 的上下限
     MIN_TOKENS_PER_SEGMENT = 30
-    MAX_TOKENS_PER_SEGMENT = 200
+    MAX_TOKENS_PER_SEGMENT = 120
     
     print(">> starting inference...")
     self._set_gr_progress(0, "starting inference...")
@@ -235,6 +237,7 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
 
     self._set_gr_progress(0.1, "text processing...")
     text_tokens_list = self.tokenizer.tokenize(text)
+    print('total tokens: ', len(text_tokens_list))
     
     # 根据auto_split参数决定是否自动切割
     if auto_split:
@@ -524,7 +527,6 @@ def infer_fast(self, spk_audio_prompt, text, output_path,
 # 在原来 DiT 外面包了一层 padding 和图编译逻辑
 def dit_forward_wapper(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
     if self.static:
-        batch_size = x.size(0)
         T_max = self.max_seq_len
         T_actual = x.size(2)
         if T_actual > T_max:
@@ -542,28 +544,21 @@ def dit_forward_wapper(self, x, prompt_x, x_lens, t, style, cond, mask_content=F
             prompt_x = F.pad(prompt_x, (0, pad_len))
             # cond (B, T, C) -> 填充倒数第二个维度
             cond = F.pad(cond, (0, 0, 0, pad_len))
-        
-        # 检查当前 batch_size 是否已有编译图，没有则创建
-        if batch_size not in self.compiled_transformers:
+        if self.compiled_transformer is None:
             import torch_npu
             import torchair
             config = torchair.CompilerConfig()
             npu_backend = torchair.get_npu_backend(compiler_config=config)
-            self.compiled_transformers[batch_size] = torchair.inference.cache_compile(
-                self.transformer.forward, dynamic=False, fullgraph=True, backend=npu_backend, ge_cache=True, cache_dir='./.torchair_cache/index-tts'+str(batch_size)
-            )
-        
-        # 使用对应 batch_size 的编译图
-        compiled_transformer = self.compiled_transformers[batch_size]
-        return self.forward_original(x, prompt_x, x_lens, t, style, cond, mask_content, compiled_transformer)[..., :T_actual]
+            self.compiled_transformer = torchair.inference.cache_compile(self.transformer.forward, dynamic=False, fullgraph=True, backend=npu_backend, ge_cache=True)
+        return self.forward_original(x, prompt_x, x_lens, t, style, cond, mask_content)[..., :T_actual]
     else:
-        self.compiled_transformers = {}
-    return self.forward_original(x, prompt_x, x_lens, t, style, cond, mask_content, None)
+        self.compiled_transformer = None
+    return self.forward_original(x, prompt_x, x_lens, t, style, cond, mask_content)
 
 # 修改 DiT 原来的 forward
 # 1. mask padding 到最大长度以支持静态图
 # 2. 一些 batch_size=1 输入填充到 x.shape[0]
-def dit_forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False, compiled_transformer=None):
+def dit_forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
     """
         x (torch.Tensor): random noise
             shape: (batch_size, 80, T)
@@ -643,10 +638,10 @@ def dit_forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False, c
     x_mask_expanded = x_mask.unsqueeze(-1) * x_mask.unsqueeze(-2)
     
     # 使用传入的 compiled_transformer 参数
-    if compiled_transformer is None:
+    if self.compiled_transformer is None:
         x_res = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded) # [2, 1863, 512]
     else:
-        x_res = compiled_transformer(x_in, t1.unsqueeze(1), input_pos=input_pos, mask=x_mask_expanded, context=None, context_input_pos=None, cross_attention_mask=None) # [2, 1863, 512]
+        x_res = self.compiled_transformer(x_in, t1.unsqueeze(1), input_pos=input_pos, mask=x_mask_expanded, context=None, context_input_pos=None, cross_attention_mask=None) # [2, 1863, 512]
     x_res = x_res[:, 1:] if self.time_as_token else x_res
     x_res = x_res[:, 1:] if self.style_as_token else x_res
     
@@ -820,42 +815,13 @@ def gpt_forward(
         else:  # this outcome only occurs once per loop in most cases
             mel_emb = self.cached_mel_emb
         emb = torch.cat([mel_emb, text_emb], dim=1)
-    elif self.compiled_transformers is None:
+    elif self.compiled_transformer is None:
         emb = self.embeddings(input_ids)
         emb = emb + self.text_pos_embedding.get_fixed_embedding(
             attention_mask.shape[1] - mel_len, attention_mask.device
         )
-    else:
-        # 使用编译好的图
-        pass
-    
-    # 如果是静态模式且输入长度为1，使用编译好的图
-    if input_ids.shape[1] == 1 and self.compiled_transformers is not None:
-        if batch_size not in self.compiled_transformers:
-            config = torchair.CompilerConfig()
-            npu_backend = torchair.get_npu_backend(compiler_config=config)
-            self.compiled_transformers[batch_size]=torchair.inference.cache_compile(self.decode_with_embedding, dynamic=not self.static, fullgraph=True, backend=npu_backend, ge_cache=True, cache_dir='./torchair_cache/index-tts'+str(batch_size))
-        # 使用对应 batch_size 的编译图
-        compiled_transformer = self.compiled_transformers[batch_size]
-        # breakpoint()
-        transformer_outputs = compiled_transformer(
-            input_ids=input_ids.contiguous(), # 防止重编译
-            past_key_values=past_key_values,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            updated_kv_positions=updated_kv_positions,
-            trunc_index=torch.tensor(real_seq_len+1-mel_len,device=input_ids.device),
-        )
-    else:
-        # 常规执行路径
+    # breakpoint()
+    if input_ids.shape[1] != 1 or self.compiled_transformer is None:
         transformer_outputs = self.transformer(
             inputs_embeds=emb,
             past_key_values=past_key_values,
@@ -870,6 +836,24 @@ def gpt_forward(
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             updated_kv_positions=updated_kv_positions,
+        )
+    else:
+        # breakpoint()
+        transformer_outputs = self.compiled_transformer(
+            input_ids=input_ids.contiguous(), # 防止重编译
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            updated_kv_positions=updated_kv_positions,
+            trunc_index=torch.tensor(real_seq_len+1-mel_len,device=input_ids.device),
         )
     
     # breakpoint()
@@ -1125,21 +1109,31 @@ if __name__ == "__main__":
     tts = IndexTTS2NPU(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_cuda_kernel=True, use_fp16=True, static=True)
     # breakpoint()
     prompt_wav = "examples/voice_01.wav"
-    batch_size=16
-    text = 'a' * batch_size # warmup
-    # text= '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。风急天高猿啸哀，渚清沙白鸟飞回。无边落木萧萧下，不尽长江滚滚来。万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。唧唧复唧唧，木兰当户织。不闻机杼声，惟闻女叹息。脱我战时袍，著我旧时裳。当窗理云鬓，对镜帖花黄。明月几时有？把酒问青天。不知天上宫阙，今夕是何年。我欲乘风归去，又恐琼楼玉宇，高处不胜寒。起舞弄清影，何似在人间。但愿人长久，千里共婵娟。' * 4
-    tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=False, max_text_tokens_per_segment=1, num_beams=1, auto_split=False)
+    # length=25
+    # text = 'a' * length # warmup
+    # tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
     if enable_prof: 
         prof.start()
         text='测试，测试，测试，测试，测试'
         tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen2.wav", verbose=False, max_text_tokens_per_segment=6, num_beams=1, auto_split=False)
     else:
+        output_dir='output'
+        file='gen2.wav'
+        path=output_dir+'/'+file
         prompt_wav = "examples/voice_01.wav"
-        for i in range(1):
-            # text = '短句。'
-            # text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。风急天高猿啸哀，渚清沙白鸟飞回。无边落木萧萧下，不尽长江滚滚来。万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。唧唧复唧唧，木兰当户织。不闻机杼声，惟闻女叹息。脱我战时袍，著我旧时裳。当窗理云鬓，对镜帖花黄。明月几时有？把酒问青天。不知天上宫阙，今夕是何年。我欲乘风归去，又恐琼楼玉宇，高处不胜寒。起舞弄清影，何似在人间。但愿人长久，千里共婵娟。千山鸟飞绝，万径人踪灭。孤舟蓑笠翁，独钓寒江雪。故人西辞黄鹤楼，烟花三月下扬州。孤帆远影碧空尽，唯见长江天际流。'
-            text= '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。风急天高猿啸哀，渚清沙白鸟飞回。无边落木萧萧下，不尽长江滚滚来。万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。唧唧复唧唧，木兰当户织。不闻机杼声，惟闻女叹息。脱我战时袍，著我旧时裳。当窗理云鬓，对镜帖花黄。明月几时有？把酒问青天。不知天上宫阙，今夕是何年。我欲乘风归去，又恐琼楼玉宇，高处不胜寒。起舞弄清影，何似在人间。但愿人长久，千里共婵娟。' * 4
-            tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen2.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=False)
+        text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。风急天高猿啸哀，渚清沙白鸟飞回。无边落木萧萧下，不尽长江滚滚来。万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。唧唧复唧唧，木兰当户织。不闻机杼声，惟闻女叹息。脱我战时袍，著我旧时裳。当窗理云鬓，对镜帖花黄。明月几时有？把酒问青天。不知天上宫阙，今夕是何年。我欲乘风归去，又恐琼楼玉宇，高处不胜寒。起舞弄清影，何似在人间。但愿人长久，千里共婵娟。千山鸟飞绝，万径人踪灭。孤舟蓑笠翁，独钓寒江雪。故人西辞黄鹤楼，烟花三月下扬州。孤帆远影碧空尽，唯见长江天际流。'
+        tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path=path, verbose=False, max_text_tokens_per_segment=120, num_beams=1)
+        meta='|'.join([file, '翻译翻译什么叫惊喜', 'voice_01.wav', text, ''])
+        with open('meta.lst', 'w', encoding='utf-8') as f:
+            f.write(meta)
+        # loop=2
+        # for length in [256, 300, 400, 512, 800, 1024]:
+        #     print('testing length: ', length)
+        #     for i in range(loop):
+        #         # text = '短句。'
+        #         # text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。朝辞白帝彩云间，千里江陵一日还。两岸猿声啼不住，轻舟已过万重山。风急天高猿啸哀，渚清沙白鸟飞回。无边落木萧萧下，不尽长江滚滚来。万里悲秋常作客，百年多病独登台。艰难苦恨繁霜鬓，潦倒新停浊酒杯。唧唧复唧唧，木兰当户织。不闻机杼声，惟闻女叹息。脱我战时袍，著我旧时裳。当窗理云鬓，对镜帖花黄。明月几时有？把酒问青天。不知天上宫阙，今夕是何年。我欲乘风归去，又恐琼楼玉宇，高处不胜寒。起舞弄清影，何似在人间。但愿人长久，千里共婵娟。千山鸟飞绝，万径人踪灭。孤舟蓑笠翁，独钓寒江雪。故人西辞黄鹤楼，烟花三月下扬州。孤帆远影碧空尽，唯见长江天际流。'
+        #         text = ''.join(random.choices(string.ascii_letters, k=length))
+        #         tts.infer_fast(spk_audio_prompt=prompt_wav, text=text, output_path="gen2.wav", verbose=False, max_text_tokens_per_segment=120, num_beams=1, auto_split=True)
     if enable_prof:
         prof.step()
         prof.stop()
