@@ -24,7 +24,7 @@ def test_accuracy():
     # Create model
     # SnakeBeta with logscale=True
     act = SnakeBeta(C, alpha_logscale=True).cuda()
-    model_ref = Activation1d(act, fused=False).cuda()
+    model_ref = Activation1d(act).cuda()
     
     # Run reference
     with torch.no_grad():

@@ -20,7 +20,7 @@ def benchmark():
     x = torch.randn(B, C, T).cuda()
     
     act = SnakeBeta(C, alpha_logscale=True).cuda()
-    model_ref = Activation1d(act, fused=False).cuda()
+    model_ref = Activation1d(act).cuda()
     
     up_filter = model_ref.upsample.filter
     down_filter = model_ref.downsample.lowpass.filter

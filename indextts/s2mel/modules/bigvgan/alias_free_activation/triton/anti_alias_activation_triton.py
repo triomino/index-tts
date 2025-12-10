@@ -31,11 +31,6 @@ def anti_alias_activation_kernel(
     alpha_val = tl.exp(alpha_val)
     beta_val = tl.exp(beta_val)
 
-    # Load Filters
-    filter_offsets = tl.arange(0, FILTER_SIZE)
-    up_filter = tl.load(up_ftr_ptr + filter_offsets)
-    down_filter = tl.load(down_ftr_ptr + filter_offsets)
-
     # Block offsets
     block_start = pid_x * BLOCK_SIZE
     
@@ -74,7 +69,10 @@ def anti_alias_activation_kernel(
             valid_mask = (p >= -UPSAMPLE_PAD) & (p < seq_len + UPSAMPLE_PAD)
             
             term = tl.where(mask_even & valid_mask, 2.0 * val, 0.0)
-            up_acc += term * up_filter[u]
+            
+            # Load up_filter coefficient
+            coef_up = tl.load(up_ftr_ptr + u)
+            up_acc += term * coef_up
             
         # Activation
         no_div_by_zero = 1e-9
@@ -82,7 +80,8 @@ def anti_alias_activation_kernel(
         act_val = up_acc + (1.0 / (beta_val + no_div_by_zero)) * sin_val * sin_val
         
         # Downsample accumulation
-        out_acc += act_val * down_filter[f]
+        coef_down = tl.load(down_ftr_ptr + f)
+        out_acc += act_val * coef_down
 
     # Store output
     mask_out = global_out_indices < seq_len
